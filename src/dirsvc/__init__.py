@@ -1,0 +1,1 @@
+"""Directory service security helpers for the LDAP escaping exercise."""
