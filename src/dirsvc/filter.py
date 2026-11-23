@@ -27,6 +27,30 @@ escape_dn 处理 RFC 4514 特殊字符、空字节、开头井号与首尾空格
 只允许标准库 re、base64 与 pytest；离线运行，不使用随机数，不联网。
 """
 
+import re
+
+_PLACEHOLDER_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+# 缺陷 1/2/3：通配符、括号、空字节与反斜杠都必须转义，且十六进制固定两位。
+_VALUE_ESCAPES = {
+    "\x00": r"\00",
+    "(": r"\28",
+    ")": r"\29",
+    "*": r"\2a",
+    "\\": r"\5c",
+}
+
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _is_mapping(obj) -> bool:
+    """按行为判断映射，不泄漏对 dict 的依赖，也不把字符串当成映射。"""
+    return (
+        not isinstance(obj, (str, bytes, bytearray))
+        and hasattr(obj, "keys")
+        and hasattr(obj, "__getitem__")
+    )
+
 
 def escape_value(value: str) -> str:
     r"""按 RFC 4515 转义一个过滤器断言值。
@@ -50,7 +74,10 @@ def escape_value(value: str) -> str:
     不做 Unicode 规范化。输出只由输入字符决定。
     """
 
-    raise NotImplementedError
+    if not isinstance(value, str):
+        raise TypeError("value must be str")
+    # 缺陷 1：星号与括号必须转义；缺陷 2：十六进制固定两位；缺陷 3：空字节必须转义。
+    return "".join(_VALUE_ESCAPES.get(ch, ch) for ch in value)
 
 
 def escape_dn(value: str) -> str:
@@ -76,7 +103,41 @@ def escape_dn(value: str) -> str:
     不做 Unicode 规范化。输出只由原始字符决定，不对输出再次调用本函数。
     """
 
-    raise NotImplementedError
+    if not isinstance(value, str):
+        raise TypeError("value must be str")
+    if value == "":
+        return ""
+
+    last = len(value) - 1
+    out = []
+    for index, char in enumerate(value):
+        # 缺陷 4：逗号之外的等号、加号、引号、尖括号与分号也必须转义。
+        if char == "\\":
+            out.append("\\\\")
+        elif char == ",":
+            out.append("\\,")
+        elif char == "=":
+            out.append("\\=")
+        elif char == "+":
+            out.append("\\+")
+        elif char == '"':
+            out.append('\\"')
+        elif char == "<":
+            out.append("\\<")
+        elif char == ">":
+            out.append("\\>")
+        elif char == ";":
+            out.append("\\;")
+        elif char == "\x00":
+            out.append("\\00")
+        elif char == "#" and index == 0:
+            out.append("\\#")
+        elif char == " " and (index == 0 or index == last):
+            # 全为空格时首尾各只转义一次，不叠加反斜杠。
+            out.append("\\ ")
+        else:
+            out.append(char)
+    return "".join(out)
 
 
 def build_filter(template: str, params: dict) -> str:
@@ -102,7 +163,32 @@ def build_filter(template: str, params: dict) -> str:
     文本段与逐字符转义后的参数段按原顺序拼接的结果，不能 trim 或规范化参数。
     """
 
-    raise NotImplementedError
+    if not isinstance(template, str):
+        raise TypeError("template must be str")
+    if not _is_mapping(params):
+        raise TypeError("params must be a mapping")
+
+    segments = parse_template(template)
+
+    declared = {piece for kind, piece in segments if kind == "param"}
+    extra = [key for key in params.keys() if key not in declared]
+    if extra:
+        raise ValueError("undeclared parameters: {0!r}".format(extra))
+    for name in declared:
+        if name not in params:
+            raise KeyError(name)
+
+    out = []
+    for kind, piece in segments:
+        if kind == "text":
+            out.append(piece)
+        else:
+            value = params[piece]
+            if not isinstance(value, str):
+                raise TypeError("parameter {0!r} must be str".format(piece))
+            # 缺陷 5：参数一律经过 escape_value，不能原样插入。
+            out.append(escape_value(value))
+    return "".join(out)
 
 
 def parse_template(template: str) -> list:
@@ -143,7 +229,65 @@ def parse_template(template: str) -> list:
     不修复畸形输入。
     """
 
-    raise NotImplementedError
+    if not isinstance(template, str):
+        raise TypeError("template must be str")
+    if template == "":
+        raise ValueError("empty template")
+    if not template.startswith("(") or not template.endswith(")"):
+        raise ValueError("template must be a single parenthesised filter")
+    # 缺陷 6：括号深度从 0 开始，任何位置不能为负，只能在最后一个字符处回到 0。
+    depth = 0
+    for index, char in enumerate(template):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                raise ValueError("unbalanced parentheses")
+            if depth == 0 and index != len(template) - 1:
+                raise ValueError("multiple top-level filters")
+    if depth != 0:
+        raise ValueError("unbalanced parentheses")
+    if "()" in template:
+        raise ValueError("empty filter")
+
+    segments = []
+    buffer = []
+
+    def flush():
+        if buffer:
+            segments.append(("text", "".join(buffer)))
+            del buffer[:]
+
+    index = 0
+    length = len(template)
+    while index < length:
+        char = template[index]
+        if char == "{":
+            close = template.find("}", index + 1)
+            if close == -1:
+                raise ValueError("unmatched opening brace")
+            name = template[index + 1:close]
+            if not _PLACEHOLDER_NAME.match(name):
+                raise ValueError("invalid placeholder name: {0!r}".format(name))
+            # 占位符必须占满一个断言值：前一个字符是等号，后一个字符是右括号。
+            if index == 0 or template[index - 1] != "=":
+                raise ValueError("placeholder is not in a value position")
+            if close + 1 >= length or template[close + 1] != ")":
+                raise ValueError("placeholder is not in a value position")
+            flush()
+            segments.append(("param", name))
+            index = close + 1
+        elif char == "}":
+            raise ValueError("unmatched closing brace")
+        else:
+            buffer.append(char)
+            index += 1
+
+    flush()
+    if not segments:
+        return [("text", template)]
+    return segments
 
 
 def check_injection(filter_text: str) -> list[str]:
@@ -170,7 +314,36 @@ def check_injection(filter_text: str) -> list[str]:
     filter_text 必须是 str，否则抛 TypeError。不 trim、不折叠空白、不规范化。
     """
 
-    raise NotImplementedError
+    if not isinstance(filter_text, str):
+        raise TypeError("filter_text must be str")
+
+    found = []
+    index = 0
+    length = len(filter_text)
+    while index < length:
+        char = filter_text[index]
+        if (
+            char == "\\"
+            and index + 2 < length
+            and filter_text[index + 1] in _HEX_DIGITS
+            and filter_text[index + 2] in _HEX_DIGITS
+        ):
+            index += 3
+            continue
+        if char == "*":
+            code = "wildcard"
+        elif char == "(":
+            code = "left_paren"
+        # 缺陷 7：右括号的闭合注入同样必须检出，不能只查左括号。
+        elif char == ")":
+            code = "right_paren"
+        else:
+            index += 1
+            continue
+        if code not in found:
+            found.append(code)
+        index += 1
+    return found
 
 
 def normalize(value: str) -> str:
@@ -190,7 +363,10 @@ def normalize(value: str) -> str:
     不变。
     """
 
-    raise NotImplementedError
+    if not isinstance(value, str):
+        raise TypeError("value must be str")
+    # 缺陷 8：split() 去掉首尾空白并折叠内部连续空白，不改变非空白字符。
+    return " ".join(value.split())
 
 
 def validate_policy(policy: dict) -> list[str]:
@@ -216,7 +392,18 @@ def validate_policy(policy: dict) -> list[str]:
     判定。
     """
 
-    raise NotImplementedError
+    if not _is_mapping(policy):
+        raise TypeError("policy must be a mapping")
+
+    problems = []
+    # 缺陷 9：allow_raw_concat 为 True（或非 bool）表示允许原样拼接，必须报出。
+    if "allow_raw_concat" in policy and policy["allow_raw_concat"] is not False:
+        problems.append("raw_concat")
+    if "allow_wildcard" in policy and policy["allow_wildcard"] is not False:
+        problems.append("wildcard")
+    if "escape_dn" in policy and policy["escape_dn"] is not True:
+        problems.append("dn_escape")
+    return problems
 
 
 def filter_batch(requests: list[dict], policy: dict) -> dict:
@@ -247,4 +434,31 @@ def filter_batch(requests: list[dict], policy: dict) -> dict:
     每个结果必须与单独调用 build_filter 完全一致；两批调用互不影响。
     """
 
-    raise NotImplementedError
+    if isinstance(requests, (str, bytes, bytearray)):
+        raise TypeError("requests must be a sequence of mappings")
+    try:
+        iterator = iter(requests)
+    except TypeError:
+        raise TypeError("requests must be a sequence of mappings") from None
+
+    problems = validate_policy(policy)
+    if problems:
+        raise ValueError("unsafe policy: {0!r}".format(problems))
+
+    # 缺陷 10：每个请求独立解析、独立取值，绝不复用上一次的分段或参数。
+    result = {}
+    seen = set()
+    for request in iterator:
+        if not _is_mapping(request):
+            raise TypeError("request must be a mapping")
+        for field in ("id", "template", "params"):
+            if field not in request:
+                raise ValueError("missing request field: {0}".format(field))
+        request_id = request["id"]
+        if not isinstance(request_id, str) or request_id == "":
+            raise ValueError("request id must be a non-empty str")
+        if request_id in seen:
+            raise ValueError("duplicate request id: {0!r}".format(request_id))
+        seen.add(request_id)
+        result[request_id] = build_filter(request["template"], request["params"])
+    return result
